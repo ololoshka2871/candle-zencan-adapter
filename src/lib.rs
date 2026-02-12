@@ -330,8 +330,6 @@ fn worker_loop(
     cmd_rx: mpsc::Receiver<Command>,
     rx_tx: tokio_mpsc::Sender<ReceiverEvent>,
 ) {
-    let mut cmd_rx = cmd_rx;
-    let mut rx_tx = rx_tx;
     let timeout_ms = 10u32;
 
     loop {

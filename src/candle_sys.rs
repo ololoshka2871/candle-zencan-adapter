@@ -1,3 +1,5 @@
+// this file is based on candle library  https://github.com/elliotwoods/Candle.NET.git/Candle/candle.c
+
 use std::mem::{size_of, zeroed};
 use std::ptr::{self};
 
@@ -15,11 +17,11 @@ use windows::Win32::Devices::Usb::{
 };
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NO_MORE_ITEMS,
-    HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    HANDLE, WIN32_ERROR, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::OVERLAPPED;
 use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
@@ -191,6 +193,7 @@ impl Default for CandleRxUrb {
     }
 }
 
+#[derive(Clone, Copy)]
 struct CandleDevice {
     path: [u16; 256],
     state: CandleDevState,
@@ -302,8 +305,7 @@ pub unsafe fn candle_list_scan(list: *mut *mut std::ffi::c_void) -> bool {
                 break;
             }
         } else {
-            let err = unsafe { GetLastError().0 };
-            if err == ERROR_NO_MORE_ITEMS.0 {
+            if Some(ERROR_NO_MORE_ITEMS) == get_last_err_code() {
                 l.num_devices = i as u8;
                 l.last_error = CandleErr::Ok;
                 ok = true;
@@ -391,10 +393,14 @@ pub unsafe fn candle_dev_open(device: *mut std::ffi::c_void) -> bool {
     let dev = &mut *(device as *mut CandleDevice);
     if candle_dev_internal_open(dev) {
         for i in 0..CANDLE_URB_COUNT {
-            let ev = CreateEventW(None, true, false, None);
-            dev.rxevents[i] = ev;
-            dev.rxurbs[i].ovl.hEvent = ev;
-            if !candle_prepare_read(dev, i) {
+            if let Ok(ev) = CreateEventW(None, true, false, None) {
+                dev.rxevents[i] = ev;
+                dev.rxurbs[i].ovl.hEvent = ev;
+                if !candle_prepare_read(dev, i) {
+                    candle_close_rxurbs(dev);
+                    return false;
+                }
+            } else {
                 candle_close_rxurbs(dev);
                 return false;
             }
@@ -570,12 +576,12 @@ pub unsafe fn candle_frame_send(
         None,
     );
 
-    dev.last_error = if rc.as_bool() {
+    dev.last_error = if rc.is_ok() {
         CandleErr::Ok
     } else {
         CandleErr::SendFrame
     };
-    rc.as_bool()
+    rc.is_ok()
 }
 
 pub unsafe fn candle_frame_read(
@@ -599,12 +605,12 @@ pub unsafe fn candle_frame_read(
         return false;
     }
 
-    if wait_result < WAIT_OBJECT_0 || wait_result >= WAIT_OBJECT_0 + CANDLE_URB_COUNT as u32 {
+    if wait_result.0 < WAIT_OBJECT_0.0 || wait_result.0 >= (WAIT_OBJECT_0.0 + CANDLE_URB_COUNT as u32) {
         dev.last_error = CandleErr::ReadWait;
         return false;
     }
 
-    let urb_num = (wait_result - WAIT_OBJECT_0) as usize;
+    let urb_num = (wait_result.0 - WAIT_OBJECT_0.0) as usize;
     let mut bytes_transferred = 0u32;
     let rc = WinUsb_GetOverlappedResult(
         dev.winusb_handle,
@@ -613,7 +619,7 @@ pub unsafe fn candle_frame_read(
         false,
     );
 
-    if !rc.as_bool() {
+    if rc.is_err() {
         let _ = candle_prepare_read(dev, urb_num);
         dev.last_error = CandleErr::ReadResult;
         return false;
@@ -655,7 +661,7 @@ fn candle_read_di(
         )
     };
 
-    if unsafe { GetLastError().0 } != ERROR_INSUFFICIENT_BUFFER.0 {
+    if get_last_err_code() == Some(ERROR_INSUFFICIENT_BUFFER) {
         dev.last_error = CandleErr::SetupDiIfDetails;
         return false;
     }
@@ -713,7 +719,7 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
     let handle = unsafe {
         CreateFileW(
             path_ptr,
-            GENERIC_READ | GENERIC_WRITE,
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -722,15 +728,17 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
         )
     };
 
-    if handle == INVALID_HANDLE_VALUE {
+    let handle = if let Ok(h) = handle {
+        dev.device_handle = h;
+        h
+    } else {
         dev.last_error = CandleErr::CreateFile;
         return false;
-    }
-    dev.device_handle = handle;
+    };
 
     let mut winusb_handle = WINUSB_INTERFACE_HANDLE::default();
     let rc = unsafe { WinUsb_Initialize(handle, &mut winusb_handle) };
-    if !rc.as_bool() {
+    if rc.is_err() {
         dev.last_error = CandleErr::WinUsbInitialize;
         unsafe { CloseHandle(handle) };
         return false;
@@ -739,7 +747,7 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
 
     let mut iface_descriptor = unsafe { zeroed() };
     let rc = unsafe { WinUsb_QueryInterfaceSettings(winusb_handle, 0, &mut iface_descriptor) };
-    if !rc.as_bool() {
+    if rc.is_err() {
         dev.last_error = CandleErr::QueryInterface;
         unsafe { WinUsb_Free(winusb_handle) };
         unsafe { CloseHandle(handle) };
@@ -751,7 +759,7 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
     for i in 0..iface_descriptor.bNumEndpoints {
         let mut pipe_info = WINUSB_PIPE_INFORMATION::default();
         let rc = unsafe { WinUsb_QueryPipe(winusb_handle, 0, i, &mut pipe_info) };
-        if !rc.as_bool() {
+        if rc.is_err() {
             dev.last_error = CandleErr::QueryPipe;
             unsafe { WinUsb_Free(winusb_handle) };
             unsafe { CloseHandle(handle) };
@@ -787,13 +795,13 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
         WinUsb_SetPipePolicy(
             winusb_handle,
             dev.bulk_in_pipe,
-            WINUSB_PIPE_POLICY::RAW_IO,
+            WINUSB_PIPE_POLICY(7u32), //WINUSB_PIPE_POLICY::RAW_IO
             size_of::<u8>() as u32,
             &use_raw_io as *const u8 as *const _,
         )
     };
 
-    if !rc.as_bool() {
+    if rc.is_err() {
         dev.last_error = CandleErr::SetPipeRawIo;
         unsafe { WinUsb_Free(winusb_handle) };
         unsafe { CloseHandle(handle) };
@@ -835,7 +843,7 @@ fn candle_prepare_read(dev: &mut CandleDevice, urb_num: usize) -> bool {
         )
     };
 
-    if rc.as_bool() || unsafe { GetLastError().0 } != ERROR_IO_PENDING.0 {
+    if rc.is_ok() || get_last_err_code() == Some(ERROR_IO_PENDING) {
         dev.last_error = CandleErr::PrepareRead;
         false
     } else {
@@ -883,7 +891,7 @@ fn usb_control_msg(
             None,
         )
     }
-    .as_bool()
+    .is_ok()
 }
 
 fn candle_ctrl_set_host_format(dev: &mut CandleDevice) -> bool {
@@ -989,4 +997,9 @@ fn candle_ctrl_set_bittiming(
 
     dev.last_error = if rc { CandleErr::Ok } else { CandleErr::SetBittiming };
     rc
+}
+
+fn get_last_err_code() -> Option<WIN32_ERROR> {
+    let err = unsafe { GetLastError() };
+    err.err().map(|e| WIN32_ERROR(e.code().0 as u32))
 }

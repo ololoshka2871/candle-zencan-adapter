@@ -9,7 +9,7 @@ zencan-common = { version = "0.0.3", default-features = false, features = [
 	"std",
 	"log",
 ] }
-windows = { version = "0.51", features = [
+windows = { version = "0.62", features = [
 	"Win32_Devices_DeviceAndDriverInstallation",
 	"Win32_Devices_Usb",
 	"Win32_Foundation",

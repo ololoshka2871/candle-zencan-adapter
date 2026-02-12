@@ -1,11 +1,8 @@
 #![allow(missing_docs)]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![warn(missing_copy_implementations)]
 
 mod candle_sys;
 
 use std::fmt;
-use std::ptr::NonNull;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -15,12 +12,7 @@ use zencan_common::{
     traits::{AsyncCanReceiver, AsyncCanSender, CanSendError},
 };
 
-use crate::candle_sys::{
-    candle_channel_count, candle_channel_set_bitrate, candle_channel_start, candle_channel_stop,
-    candle_dev_close, candle_dev_free, candle_dev_get, candle_dev_get_path, candle_dev_last_error,
-    candle_dev_open, candle_frame_read, candle_frame_send, candle_list_free, candle_list_length,
-    candle_list_scan, CandleErr, CandleFrame,
-};
+pub use crate::candle_sys::{CandleDevice, CandleErr, CandleFrame, CandleList};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CandleConfig {
@@ -160,78 +152,52 @@ impl AsyncCanReceiver for CandleReceiver {
 }
 
 pub fn list_devices() -> Result<Vec<CandleDeviceInfo>, CandleError> {
-    unsafe {
-        let mut list = std::ptr::null_mut();
-        if !candle_list_scan(&mut list) {
-            return Err(CandleError::NativeError {
-                code: CandleErr::Unknown,
-                context: "list_scan",
-            });
-        }
+    let list = CandleList::scan().map_err(|code| CandleError::NativeError {
+        code,
+        context: "list_scan",
+    })?;
 
-        let mut length: u8 = 0;
-        if !candle_list_length(list, &mut length) {
-            let _ = candle_list_free(list);
-            return Err(CandleError::NativeError {
-                code: CandleErr::Unknown,
-                context: "list_length",
-            });
-        }
+    let length = list.len();
+    let mut devices = Vec::with_capacity(length as usize);
+    for index in 0..length {
+        let device = list.device(index).map_err(|code| CandleError::NativeError {
+            code,
+            context: "dev_get",
+        })?;
 
-        let mut devices = Vec::with_capacity(length as usize);
-        for index in 0..length {
-            let mut handle = std::ptr::null_mut();
-            if !candle_dev_get(list, index, &mut handle) {
-                let _ = candle_list_free(list);
-                return Err(CandleError::NativeError {
-                    code: CandleErr::Unknown,
-                    context: "dev_get",
-                });
-            }
-
-            let path = device_path(handle).unwrap_or_default();
-            let channel_count = device_channel_count(handle).unwrap_or(0);
-            devices.push(CandleDeviceInfo {
-                index,
-                path,
-                channel_count,
-            });
-
-            let _ = candle_dev_free(handle);
-        }
-
-        let _ = candle_list_free(list);
-        Ok(devices)
+        devices.push(CandleDeviceInfo {
+            index,
+            path: device.path_string(),
+            channel_count: device.channel_count(),
+        });
     }
+
+    Ok(devices)
 }
 
 pub fn open_candle(config: CandleConfig) -> Result<(CandleSender, CandleReceiver), CandleError> {
-    let device = open_device(config.device_index)?;
+    let mut device = open_device(config.device_index)?;
 
-    let channel_count = device_channel_count(device.as_ptr()).unwrap_or(0);
+    let channel_count = device.channel_count();
     if config.channel >= channel_count {
-        unsafe { candle_dev_free(device.as_ptr()) };
+        device.close();
         return Err(CandleError::InvalidChannel(config.channel));
     }
 
-    unsafe {
-        if !candle_channel_set_bitrate(device.as_ptr(), config.channel, config.bitrate) {
-            let code = CandleErr::from_raw(candle_dev_last_error(device.as_ptr()) as i32);
-            let _ = candle_dev_free(device.as_ptr());
-            return Err(CandleError::NativeError {
-                code,
-                context: "channel_set_bitrate",
-            });
-        }
+    if let Err(code) = device.channel_set_bitrate(config.channel, config.bitrate) {
+        device.close();
+        return Err(CandleError::NativeError {
+            code,
+            context: "channel_set_bitrate",
+        });
+    }
 
-        if !candle_channel_start(device.as_ptr(), config.channel, 0) {
-            let code = CandleErr::from_raw(candle_dev_last_error(device.as_ptr()) as i32);
-            let _ = candle_dev_free(device.as_ptr());
-            return Err(CandleError::NativeError {
-                code,
-                context: "channel_start",
-            });
-        }
+    if let Err(code) = device.channel_start(config.channel, 0) {
+        device.close();
+        return Err(CandleError::NativeError {
+            code,
+            context: "channel_start",
+        });
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -254,78 +220,34 @@ pub fn open_candle(config: CandleConfig) -> Result<(CandleSender, CandleReceiver
     ))
 }
 
-fn open_device(index: u8) -> Result<NonNull<std::ffi::c_void>, CandleError> {
-    unsafe {
-        let mut list = std::ptr::null_mut();
-        if !candle_list_scan(&mut list) {
-            return Err(CandleError::NativeError {
-                code: CandleErr::Unknown,
-                context: "list_scan",
-            });
-        }
+fn open_device(index: u8) -> Result<CandleDevice, CandleError> {
+    let list = CandleList::scan().map_err(|code| CandleError::NativeError {
+        code,
+        context: "list_scan",
+    })?;
 
-        let mut length: u8 = 0;
-        if !candle_list_length(list, &mut length) {
-            let _ = candle_list_free(list);
-            return Err(CandleError::NativeError {
-                code: CandleErr::Unknown,
-                context: "list_length",
-            });
-        }
-
-        if index >= length {
-            let _ = candle_list_free(list);
-            return Err(CandleError::InvalidDeviceIndex(index));
-        }
-
-        let mut handle = std::ptr::null_mut();
-        if !candle_dev_get(list, index, &mut handle) {
-            let _ = candle_list_free(list);
-            return Err(CandleError::NativeError {
-                code: CandleErr::Unknown,
-                context: "dev_get",
-            });
-        }
-        let _ = candle_list_free(list);
-
-        if !candle_dev_open(handle) {
-            let code = CandleErr::from_raw(candle_dev_last_error(handle) as i32);
-            let _ = candle_dev_free(handle);
-            return Err(CandleError::NativeError {
-                code,
-                context: "dev_open",
-            });
-        }
-
-        Ok(NonNull::new(handle).ok_or(CandleError::ChannelClosed)?)
+    let length = list.len();
+    if index >= length {
+        return Err(CandleError::InvalidDeviceIndex(index));
     }
-}
 
-fn device_channel_count(handle: *mut std::ffi::c_void) -> Option<u8> {
-    unsafe {
-        let mut count: u8 = 0;
-        if candle_channel_count(handle, &mut count) {
-            Some(count)
-        } else {
-            None
-        }
-    }
-}
+    let mut device = list.device(index).map_err(|code| CandleError::NativeError {
+        code,
+        context: "dev_get",
+    })?;
 
-fn device_path(handle: *mut std::ffi::c_void) -> Option<String> {
-    let mut buf = [0u16; 255];
-    unsafe {
-        if candle_dev_get_path(handle, buf.as_mut_ptr()) {
-            let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
-            Some(String::from_utf16_lossy(&buf[..len]))
-        } else {
-            None
-        }
+    if let Err(code) = device.open() {
+        return Err(CandleError::NativeError {
+            code,
+            context: "dev_open",
+        });
     }
+
+    Ok(device)
 }
 
 fn worker_loop(
-    device: NonNull<std::ffi::c_void>,
+    mut device: CandleDevice,
     channel: u8,
     cmd_rx: mpsc::Receiver<Command>,
     rx_tx: tokio_mpsc::Sender<ReceiverEvent>,
@@ -336,21 +258,18 @@ fn worker_loop(
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Command::Send { frame, reply } => {
-                    let result = unsafe { send_frame(device.as_ptr(), channel, frame) };
+                    let result = send_frame(&mut device, channel, frame);
                     let _ = reply.send(result);
                 }
                 Command::Shutdown => {
-                    unsafe {
-                        let _ = candle_channel_stop(device.as_ptr(), channel);
-                        let _ = candle_dev_close(device.as_ptr());
-                        let _ = candle_dev_free(device.as_ptr());
-                    }
+                    let _ = device.channel_stop(channel);
+                    device.close();
                     return;
                 }
             }
         }
 
-        match unsafe { read_frame(device.as_ptr(), timeout_ms) } {
+        match read_frame(&mut device, timeout_ms) {
             Ok(Some(msg)) => {
                 let _ = rx_tx.blocking_send(Ok(msg));
             }
@@ -362,11 +281,7 @@ fn worker_loop(
     }
 }
 
-unsafe fn send_frame(
-    device: *mut std::ffi::c_void,
-    channel: u8,
-    msg: CanMessage,
-) -> Result<(), SendError> {
+fn send_frame(device: &mut CandleDevice, channel: u8, msg: CanMessage) -> Result<(), SendError> {
     let mut frame = CandleFrame::default();
     frame.can_id = msg.id().raw();
     if msg.id().is_extended() {
@@ -379,23 +294,19 @@ unsafe fn send_frame(
     frame.channel = channel;
     frame.data[..msg.dlc as usize].copy_from_slice(msg.data());
 
-    if candle_frame_send(device, channel, &mut frame) {
+    if device.frame_send(channel, &mut frame).is_ok() {
         Ok(())
     } else {
         Err(SendError {
             message: msg,
-            details: format!("send failed: {:?}", CandleErr::from_raw(candle_dev_last_error(device) as i32)),
+            details: format!("send failed: {:?}", device.last_error()),
         })
     }
 }
 
-unsafe fn read_frame(
-    device: *mut std::ffi::c_void,
-    timeout_ms: u32,
-) -> Result<Option<CanMessage>, ReceiveError> {
+fn read_frame(device: &mut CandleDevice, timeout_ms: u32) -> Result<Option<CanMessage>, ReceiveError> {
     let mut frame = CandleFrame::default();
-    if !candle_frame_read(device, &mut frame, timeout_ms) {
-        let code = CandleErr::from_raw(candle_dev_last_error(device) as i32);
+    if let Err(code) = device.frame_read(&mut frame, timeout_ms) {
         if code == CandleErr::ReadTimeout {
             return Ok(None);
         }

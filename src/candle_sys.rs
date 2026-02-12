@@ -38,7 +38,7 @@ const USB_RECIP_INTERFACE: u8 = 0x01;
 const CANDLE_BREQ_HOST_FORMAT: u8 = 0;
 const CANDLE_BREQ_BITTIMING: u8 = 1;
 const CANDLE_BREQ_MODE: u8 = 2;
-const CANDLE_BREQ_BERR: u8 = 3;
+#[allow(dead_code)]const CANDLE_BREQ_BERR: u8 = 3;
 const CANDLE_BREQ_BT_CONST: u8 = 4;
 const CANDLE_BREQ_DEVICE_CONFIG: u8 = 5;
 const CANDLE_TIMESTAMP_GET: u8 = 6;
@@ -173,12 +173,11 @@ pub struct CandleCapability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-enum CandleDevState {
+pub enum CandleDevState {
     Avail = 0,
     InUse = 1,
 }
 
-#[derive(Clone, Copy)]
 struct CandleRxUrb {
     ovl: OVERLAPPED,
     buf: [u8; 128],
@@ -186,15 +185,14 @@ struct CandleRxUrb {
 
 impl Default for CandleRxUrb {
     fn default() -> Self {
-        Self {
-            ovl: unsafe { zeroed() },
-            buf: [0; 128],
+        Self { 
+            ovl: OVERLAPPED::default(), 
+            buf: [0; 128] 
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct CandleDevice {
+pub struct CandleDevice {
     path: [u16; 256],
     state: CandleDevState,
     last_error: CandleErr,
@@ -209,26 +207,28 @@ struct CandleDevice {
     rxevents: [HANDLE; CANDLE_URB_COUNT],
 }
 
+unsafe impl Send for CandleDevice {}
+
 impl Default for CandleDevice {
     fn default() -> Self {
         Self {
             path: [0; 256],
             state: CandleDevState::Avail,
             last_error: CandleErr::Ok,
-            device_handle: HANDLE(0),
+            device_handle: HANDLE::default(),
             winusb_handle: WINUSB_INTERFACE_HANDLE::default(),
             interface_number: 0,
             bulk_in_pipe: 0,
             bulk_out_pipe: 0,
             dconf: CandleDeviceConfig::default(),
             bt_const: CandleCapability::default(),
-            rxurbs: [CandleRxUrb::default(); CANDLE_URB_COUNT],
-            rxevents: [HANDLE(0); CANDLE_URB_COUNT],
+            rxurbs: std::array::from_fn(|_| CandleRxUrb::default()),
+            rxevents: std::array::from_fn(|_| HANDLE::default()),
         }
     }
 }
 
-struct CandleList {
+pub struct CandleList {
     num_devices: u8,
     last_error: CandleErr,
     devices: [CandleDevice; CANDLE_MAX_DEVICES],
@@ -239,7 +239,7 @@ impl Default for CandleList {
         Self {
             num_devices: 0,
             last_error: CandleErr::Ok,
-            devices: [CandleDevice::default(); CANDLE_MAX_DEVICES],
+            devices: std::array::from_fn(|_| CandleDevice::default()),
         }
     }
 }
@@ -272,376 +272,298 @@ impl Default for CandleFrame {
     }
 }
 
-pub unsafe fn candle_list_scan(list: *mut *mut std::ffi::c_void) -> bool {
-    if list.is_null() {
-        return false;
-    }
+impl CandleList {
+    pub fn scan() -> Result<Self, CandleErr> {
+        let mut list = CandleList::default();
 
-    let mut l = Box::new(CandleList::default());
-
-    let hdi = match SetupDiGetClassDevsW(
-        Some(&CANDLE_GUID),
-        None,
-        None,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
-    ) {
-        Ok(handle) => handle,
-        Err(_) => {
-            l.last_error = CandleErr::GetDevices;
-            *list = Box::into_raw(l) as *mut std::ffi::c_void;
-            return false;
-        }
-    };
-
-    let mut ok = false;
-    for i in 0..CANDLE_MAX_DEVICES {
-        let mut interface_data = SP_DEVICE_INTERFACE_DATA::default();
-        interface_data.cbSize = size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
-
-        if SetupDiEnumDeviceInterfaces(hdi, None, &CANDLE_GUID, i as u32, &mut interface_data).is_ok() {
-            if !candle_read_di(hdi, &interface_data, &mut l.devices[i]) {
-                l.last_error = l.devices[i].last_error;
-                ok = false;
-                break;
+        let hdi = match unsafe {
+            SetupDiGetClassDevsW(
+                Some(&CANDLE_GUID),
+                None,
+                None,
+                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+            )
+        } {
+            Ok(handle) => handle,
+            Err(_) => {
+                list.last_error = CandleErr::GetDevices;
+                return Err(list.last_error);
             }
-        } else {
-            if Some(ERROR_NO_MORE_ITEMS) == get_last_err_code() {
-                l.num_devices = i as u8;
-                l.last_error = CandleErr::Ok;
-                ok = true;
-            } else {
-                l.last_error = CandleErr::SetupDiIfEnum;
-                ok = false;
+        };
+
+        let mut ok = false;
+        for i in 0..CANDLE_MAX_DEVICES {
+            let mut interface_data = SP_DEVICE_INTERFACE_DATA::default();
+            interface_data.cbSize = size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+
+            if unsafe {
+                SetupDiEnumDeviceInterfaces(hdi, None, &CANDLE_GUID, i as u32, &mut interface_data)
             }
-            break;
-        }
-    }
-
-    SetupDiDestroyDeviceInfoList(hdi);
-    *list = Box::into_raw(l) as *mut std::ffi::c_void;
-    ok
-}
-
-pub unsafe fn candle_list_free(list: *mut std::ffi::c_void) -> bool {
-    if list.is_null() {
-        return false;
-    }
-    drop(Box::from_raw(list as *mut CandleList));
-    true
-}
-
-pub unsafe fn candle_list_length(list: *mut std::ffi::c_void, length: *mut u8) -> bool {
-    if list.is_null() || length.is_null() {
-        return false;
-    }
-    let l = &*(list as *mut CandleList);
-    *length = l.num_devices;
-    true
-}
-
-pub unsafe fn candle_dev_get(
-    list: *mut std::ffi::c_void,
-    dev_num: u8,
-    device: *mut *mut std::ffi::c_void,
-) -> bool {
-    if list.is_null() || device.is_null() {
-        return false;
-    }
-
-    let l = &mut *(list as *mut CandleList);
-    if dev_num as usize >= CANDLE_MAX_DEVICES {
-        l.last_error = CandleErr::DevOutOfRange;
-        return false;
-    }
-
-    let mut dev = CandleDevice::default();
-    dev.path = l.devices[dev_num as usize].path;
-    dev.state = l.devices[dev_num as usize].state;
-    dev.last_error = CandleErr::Ok;
-
-    let boxed = Box::new(dev);
-    *device = Box::into_raw(boxed) as *mut std::ffi::c_void;
-    l.last_error = CandleErr::Ok;
-    true
-}
-
-pub unsafe fn candle_dev_get_state(
-    device: *mut std::ffi::c_void,
-    state: *mut u32,
-) -> bool {
-    if device.is_null() || state.is_null() {
-        return false;
-    }
-    let dev = &*(device as *mut CandleDevice);
-    *state = dev.state as u32;
-    true
-}
-
-pub unsafe fn candle_dev_get_path(device: *mut std::ffi::c_void, path: *mut u16) -> bool {
-    if device.is_null() || path.is_null() {
-        return false;
-    }
-    let dev = &*(device as *mut CandleDevice);
-    ptr::copy_nonoverlapping(dev.path.as_ptr(), path, dev.path.len());
-    true
-}
-
-pub unsafe fn candle_dev_open(device: *mut std::ffi::c_void) -> bool {
-    if device.is_null() {
-        return false;
-    }
-    let dev = &mut *(device as *mut CandleDevice);
-    if candle_dev_internal_open(dev) {
-        for i in 0..CANDLE_URB_COUNT {
-            if let Ok(ev) = CreateEventW(None, true, false, None) {
-                dev.rxevents[i] = ev;
-                dev.rxurbs[i].ovl.hEvent = ev;
-                if !candle_prepare_read(dev, i) {
-                    candle_close_rxurbs(dev);
-                    return false;
+            .is_ok()
+            {
+                if !candle_read_di(hdi, &interface_data, &mut list.devices[i]) {
+                    list.last_error = list.devices[i].last_error;
+                    ok = false;
+                    break;
                 }
             } else {
-                candle_close_rxurbs(dev);
-                return false;
+                if Some(ERROR_NO_MORE_ITEMS) == get_last_err_code() {
+                    list.num_devices = i as u8;
+                    list.last_error = CandleErr::Ok;
+                    ok = true;
+                } else {
+                    list.last_error = CandleErr::SetupDiIfEnum;
+                    ok = false;
+                }
+                break;
             }
         }
+
+        unsafe { let _ = SetupDiDestroyDeviceInfoList(hdi); }
+        if ok {
+            Ok(list)
+        } else {
+            Err(list.last_error)
+        }
+    }
+
+    pub fn len(&self) -> u8 {
+        self.num_devices
+    }
+
+    pub fn device(&self, dev_num: u8) -> Result<CandleDevice, CandleErr> {
+        if dev_num as usize >= self.num_devices as usize {
+            return Err(CandleErr::DevOutOfRange);
+        }
+        let mut dev = CandleDevice::default();
+        let entry = &self.devices[dev_num as usize];
+        dev.path = entry.path;
+        dev.state = entry.state;
         dev.last_error = CandleErr::Ok;
-        true
-    } else {
-        false
+        Ok(dev)
     }
 }
 
-pub unsafe fn candle_dev_get_timestamp_us(
-    device: *mut std::ffi::c_void,
-    timestamp_us: *mut u32,
-) -> bool {
-    if device.is_null() || timestamp_us.is_null() {
-        return false;
-    }
-    let dev = &mut *(device as *mut CandleDevice);
-    candle_ctrl_get_timestamp(dev, timestamp_us)
-}
-
-pub unsafe fn candle_dev_close(device: *mut std::ffi::c_void) -> bool {
-    if device.is_null() {
-        return false;
-    }
-    let dev = &mut *(device as *mut CandleDevice);
-    candle_close_rxurbs(dev);
-    WinUsb_Free(dev.winusb_handle);
-    dev.winusb_handle = WINUSB_INTERFACE_HANDLE::default();
-    CloseHandle(dev.device_handle);
-    dev.device_handle = HANDLE(0);
-    dev.last_error = CandleErr::Ok;
-    true
-}
-
-pub unsafe fn candle_dev_free(device: *mut std::ffi::c_void) -> bool {
-    if device.is_null() {
-        return false;
-    }
-    drop(Box::from_raw(device as *mut CandleDevice));
-    true
-}
-
-pub unsafe fn candle_dev_last_error(device: *mut std::ffi::c_void) -> i32 {
-    if device.is_null() {
-        return CandleErr::Unknown as i32;
-    }
-    let dev = &*(device as *mut CandleDevice);
-    dev.last_error as i32
-}
-
-pub unsafe fn candle_channel_count(device: *mut std::ffi::c_void, num_channels: *mut u8) -> bool {
-    if device.is_null() || num_channels.is_null() {
-        return false;
-    }
-    let dev = &*(device as *mut CandleDevice);
-    *num_channels = dev.dconf.icount.saturating_add(1);
-    true
-}
-
-pub unsafe fn candle_channel_get_capabilities(
-    device: *mut std::ffi::c_void,
-    channel: u8,
-    cap: *mut CandleCapability,
-) -> bool {
-    if device.is_null() || cap.is_null() {
-        return false;
-    }
-    let dev = &*(device as *mut CandleDevice);
-    if channel > dev.dconf.icount {
-        return false;
-    }
-    ptr::copy_nonoverlapping(&dev.bt_const as *const CandleCapability, cap, 1);
-    true
-}
-
-pub unsafe fn candle_channel_set_timing(
-    device: *mut std::ffi::c_void,
-    channel: u8,
-    data: *const CandleBitTiming,
-) -> bool {
-    if device.is_null() || data.is_null() {
-        return false;
-    }
-    let dev = &mut *(device as *mut CandleDevice);
-    candle_ctrl_set_bittiming(dev, channel, &*data)
-}
-
-pub unsafe fn candle_channel_set_bitrate(
-    device: *mut std::ffi::c_void,
-    channel: u8,
-    bitrate: u32,
-) -> bool {
-    if device.is_null() {
-        return false;
-    }
-    let dev = &mut *(device as *mut CandleDevice);
-
-    if dev.bt_const.fclk_can != 48_000_000 {
-        dev.last_error = CandleErr::BitrateFclk;
-        return false;
+impl CandleDevice {
+    pub fn state(&self) -> CandleDevState {
+        self.state
     }
 
-    let mut t = CandleBitTiming {
-        prop_seg: 1,
-        sjw: 1,
-        phase_seg1: 13 - 1,
-        phase_seg2: 2,
-        brp: 0,
-    };
+    pub fn path_string(&self) -> String {
+        let len = self.path.iter().position(|c| *c == 0).unwrap_or(self.path.len());
+        String::from_utf16_lossy(&self.path[..len])
+    }
 
-    match bitrate {
-        10_000 => t.brp = 300,
-        20_000 => t.brp = 150,
-        50_000 => t.brp = 60,
-        83_333 => t.brp = 36,
-        100_000 => t.brp = 30,
-        125_000 => t.brp = 24,
-        250_000 => t.brp = 12,
-        500_000 => t.brp = 6,
-        800_000 => {
-            t.brp = 4;
-            t.phase_seg1 = 12 - 1;
-            t.phase_seg2 = 2;
-        }
-        1_000_000 => t.brp = 3,
-        _ => {
-            dev.last_error = CandleErr::BitrateUnsupported;
-            return false;
+    pub fn open(&mut self) -> Result<(), CandleErr> {
+        if candle_dev_internal_open(self) {
+            for i in 0..CANDLE_URB_COUNT {
+                if let Ok(ev) = unsafe { CreateEventW(None, true, false, None) } {
+                    self.rxevents[i] = ev;
+                    self.rxurbs[i].ovl.hEvent = ev;
+                    if !candle_prepare_read(self, i) {
+                        candle_close_rxurbs(self);
+                        return Err(self.last_error);
+                    }
+                } else {
+                    candle_close_rxurbs(self);
+                    self.last_error = CandleErr::Unknown;
+                    return Err(self.last_error);
+                }
+            }
+            self.last_error = CandleErr::Ok;
+            Ok(())
+        } else {
+            Err(self.last_error)
         }
     }
 
-    candle_ctrl_set_bittiming(dev, channel, &t)
+    pub fn close(&mut self) {
+        candle_close_rxurbs(self);
+        if !self.winusb_handle.is_invalid() {
+            unsafe { let _ = WinUsb_Free(self.winusb_handle); }
+        }
+        self.winusb_handle = WINUSB_INTERFACE_HANDLE::default();
+        if !self.device_handle.is_invalid() {
+            unsafe { let _ = CloseHandle(self.device_handle); }
+        }
+        self.device_handle = HANDLE::default();
+        self.last_error = CandleErr::Ok;
+    }
+
+    pub fn last_error(&self) -> CandleErr {
+        self.last_error
+    }
+
+    pub fn channel_count(&self) -> u8 {
+        self.dconf.icount.saturating_add(1)
+    }
+
+    pub fn channel_set_bitrate(&mut self, channel: u8, bitrate: u32) -> Result<(), CandleErr> {
+        if self.bt_const.fclk_can != 48_000_000 {
+            self.last_error = CandleErr::BitrateFclk;
+            return Err(self.last_error);
+        }
+
+        let mut t = CandleBitTiming {
+            prop_seg: 1,
+            sjw: 1,
+            phase_seg1: 13 - 1,
+            phase_seg2: 2,
+            brp: 0,
+        };
+
+        match bitrate {
+            10_000 => t.brp = 300,
+            20_000 => t.brp = 150,
+            50_000 => t.brp = 60,
+            83_333 => t.brp = 36,
+            100_000 => t.brp = 30,
+            125_000 => t.brp = 24,
+            250_000 => t.brp = 12,
+            500_000 => t.brp = 6,
+            800_000 => {
+                t.brp = 4;
+                t.phase_seg1 = 12 - 1;
+                t.phase_seg2 = 2;
+            }
+            1_000_000 => t.brp = 3,
+            _ => {
+                self.last_error = CandleErr::BitrateUnsupported;
+                return Err(self.last_error);
+            }
+        }
+
+        if candle_ctrl_set_bittiming(self, channel, &t) {
+            Ok(())
+        } else {
+            Err(self.last_error)
+        }
+    }
+
+    pub fn channel_start(&mut self, channel: u8, flags: u32) -> Result<(), CandleErr> {
+        let flags = flags | CANDLE_MODE_HW_TIMESTAMP;
+        if candle_ctrl_set_device_mode(self, channel, CANDLE_DEVMODE_START, flags) {
+            Ok(())
+        } else {
+            Err(self.last_error)
+        }
+    }
+
+    pub fn channel_stop(&mut self, channel: u8) -> Result<(), CandleErr> {
+        if candle_ctrl_set_device_mode(self, channel, CANDLE_DEVMODE_RESET, 0) {
+            Ok(())
+        } else {
+            Err(self.last_error)
+        }
+    }
+
+    pub fn timestamp_us(&mut self) -> Result<u32, CandleErr> {
+        let mut timestamp_us = 0u32;
+        if candle_ctrl_get_timestamp(self, &mut timestamp_us) {
+            Ok(timestamp_us)
+        } else {
+            Err(self.last_error)
+        }
+    }
+
+    pub fn frame_send(&mut self, channel: u8, frame: &mut CandleFrame) -> Result<(), CandleErr> {
+        frame.echo_id = 0;
+        frame.channel = channel;
+
+        let mut bytes_sent = 0u32;
+        let frame_slice = unsafe {
+            std::slice::from_raw_parts(
+                frame as *const CandleFrame as *const u8,
+                size_of::<CandleFrame>(),
+            )
+        };
+        let rc = unsafe {
+            WinUsb_WritePipe(
+                self.winusb_handle,
+                self.bulk_out_pipe,
+                frame_slice,
+                Some(&mut bytes_sent),
+                None,
+            )
+        };
+
+        self.last_error = if rc.is_ok() {
+            CandleErr::Ok
+        } else {
+            CandleErr::SendFrame
+        };
+
+        if rc.is_ok() {
+            Ok(())
+        } else {
+            Err(self.last_error)
+        }
+    }
+
+    pub fn frame_read(&mut self, frame: &mut CandleFrame, timeout_ms: u32) -> Result<(), CandleErr> {
+        let wait_result = unsafe { WaitForMultipleObjects(&self.rxevents, false, timeout_ms) };
+
+        if wait_result == WAIT_TIMEOUT {
+            self.last_error = CandleErr::ReadTimeout;
+            return Err(self.last_error);
+        }
+
+        if wait_result.0 < WAIT_OBJECT_0.0
+            || wait_result.0 >= (WAIT_OBJECT_0.0 + CANDLE_URB_COUNT as u32)
+        {
+            self.last_error = CandleErr::ReadWait;
+            return Err(self.last_error);
+        }
+
+        let urb_num = (wait_result.0 - WAIT_OBJECT_0.0) as usize;
+        let mut bytes_transferred = 0u32;
+        let rc = unsafe {
+            WinUsb_GetOverlappedResult(
+                self.winusb_handle,
+                &mut self.rxurbs[urb_num].ovl,
+                &mut bytes_transferred,
+                false,
+            )
+        };
+
+        if rc.is_err() {
+            let _ = candle_prepare_read(self, urb_num);
+            self.last_error = CandleErr::ReadResult;
+            return Err(self.last_error);
+        }
+
+        if bytes_transferred < (size_of::<CandleFrame>() as u32).saturating_sub(4) {
+            let _ = candle_prepare_read(self, urb_num);
+            self.last_error = CandleErr::ReadSize;
+            return Err(self.last_error);
+        }
+
+        if bytes_transferred < size_of::<CandleFrame>() as u32 {
+            frame.timestamp_us = 0;
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.rxurbs[urb_num].buf.as_ptr(),
+                frame as *mut CandleFrame as *mut u8,
+                size_of::<CandleFrame>(),
+            );
+        }
+
+        if candle_prepare_read(self, urb_num) {
+            Ok(())
+        } else {
+            Err(self.last_error)
+        }
+    }
 }
 
-pub unsafe fn candle_channel_start(device: *mut std::ffi::c_void, channel: u8, flags: u32) -> bool {
-    if device.is_null() {
-        return false;
+impl Drop for CandleDevice {
+    fn drop(&mut self) {
+        if !self.device_handle.is_invalid() || !self.winusb_handle.is_invalid() {
+            self.close();
+        }
     }
-    let dev = &mut *(device as *mut CandleDevice);
-    let flags = flags | CANDLE_MODE_HW_TIMESTAMP;
-    candle_ctrl_set_device_mode(dev, channel, CANDLE_DEVMODE_START, flags)
-}
-
-pub unsafe fn candle_channel_stop(device: *mut std::ffi::c_void, channel: u8) -> bool {
-    if device.is_null() {
-        return false;
-    }
-    let dev = &mut *(device as *mut CandleDevice);
-    candle_ctrl_set_device_mode(dev, channel, CANDLE_DEVMODE_RESET, 0)
-}
-
-pub unsafe fn candle_frame_send(
-    device: *mut std::ffi::c_void,
-    channel: u8,
-    frame: *mut CandleFrame,
-) -> bool {
-    if device.is_null() || frame.is_null() {
-        return false;
-    }
-    let dev = &mut *(device as *mut CandleDevice);
-    (*frame).echo_id = 0;
-    (*frame).channel = channel;
-
-    let mut bytes_sent = 0u32;
-    let frame_slice = std::slice::from_raw_parts(frame as *const u8, size_of::<CandleFrame>());
-    let rc = WinUsb_WritePipe(
-        dev.winusb_handle,
-        dev.bulk_out_pipe,
-        frame_slice,
-        Some(&mut bytes_sent),
-        None,
-    );
-
-    dev.last_error = if rc.is_ok() {
-        CandleErr::Ok
-    } else {
-        CandleErr::SendFrame
-    };
-    rc.is_ok()
-}
-
-pub unsafe fn candle_frame_read(
-    device: *mut std::ffi::c_void,
-    frame: *mut CandleFrame,
-    timeout_ms: u32,
-) -> bool {
-    if device.is_null() || frame.is_null() {
-        return false;
-    }
-    let dev = &mut *(device as *mut CandleDevice);
-
-    let wait_result = WaitForMultipleObjects(
-        &dev.rxevents,
-        false,
-        timeout_ms,
-    );
-
-    if wait_result == WAIT_TIMEOUT {
-        dev.last_error = CandleErr::ReadTimeout;
-        return false;
-    }
-
-    if wait_result.0 < WAIT_OBJECT_0.0 || wait_result.0 >= (WAIT_OBJECT_0.0 + CANDLE_URB_COUNT as u32) {
-        dev.last_error = CandleErr::ReadWait;
-        return false;
-    }
-
-    let urb_num = (wait_result.0 - WAIT_OBJECT_0.0) as usize;
-    let mut bytes_transferred = 0u32;
-    let rc = WinUsb_GetOverlappedResult(
-        dev.winusb_handle,
-        &mut dev.rxurbs[urb_num].ovl,
-        &mut bytes_transferred,
-        false,
-    );
-
-    if rc.is_err() {
-        let _ = candle_prepare_read(dev, urb_num);
-        dev.last_error = CandleErr::ReadResult;
-        return false;
-    }
-
-    if bytes_transferred < (size_of::<CandleFrame>() as u32).saturating_sub(4) {
-        let _ = candle_prepare_read(dev, urb_num);
-        dev.last_error = CandleErr::ReadSize;
-        return false;
-    }
-
-    if bytes_transferred < size_of::<CandleFrame>() as u32 {
-        (*frame).timestamp_us = 0;
-    }
-
-    ptr::copy_nonoverlapping(
-        dev.rxurbs[urb_num].buf.as_ptr(),
-        frame as *mut u8,
-        size_of::<CandleFrame>(),
-    );
-
-    candle_prepare_read(dev, urb_num)
 }
 
 fn candle_read_di(
@@ -705,7 +627,7 @@ fn candle_read_di(
 
     if candle_dev_internal_open(dev) {
         dev.state = CandleDevState::Avail;
-        let _ = unsafe { candle_dev_close(dev as *mut CandleDevice as *mut std::ffi::c_void) };
+        dev.close();
     } else {
         dev.state = CandleDevState::InUse;
     }
@@ -740,7 +662,7 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
     let rc = unsafe { WinUsb_Initialize(handle, &mut winusb_handle) };
     if rc.is_err() {
         dev.last_error = CandleErr::WinUsbInitialize;
-        unsafe { CloseHandle(handle) };
+        unsafe { let _ = CloseHandle(handle); }
         return false;
     }
     dev.winusb_handle = winusb_handle;
@@ -749,8 +671,8 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
     let rc = unsafe { WinUsb_QueryInterfaceSettings(winusb_handle, 0, &mut iface_descriptor) };
     if rc.is_err() {
         dev.last_error = CandleErr::QueryInterface;
-        unsafe { WinUsb_Free(winusb_handle) };
-        unsafe { CloseHandle(handle) };
+        unsafe { let _ = WinUsb_Free(winusb_handle); }
+        unsafe { let _ = CloseHandle(handle); }
         return false;
     }
     dev.interface_number = iface_descriptor.bInterfaceNumber;
@@ -761,8 +683,8 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
         let rc = unsafe { WinUsb_QueryPipe(winusb_handle, 0, i, &mut pipe_info) };
         if rc.is_err() {
             dev.last_error = CandleErr::QueryPipe;
-            unsafe { WinUsb_Free(winusb_handle) };
-            unsafe { CloseHandle(handle) };
+            unsafe { let _ = WinUsb_Free(winusb_handle); }
+            unsafe { let _ = CloseHandle(handle); }
             return false;
         }
 
@@ -777,16 +699,16 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
             pipes_found += 1;
         } else {
             dev.last_error = CandleErr::ParseIfDescr;
-            unsafe { WinUsb_Free(winusb_handle) };
-            unsafe { CloseHandle(handle) };
+            unsafe { let _ = WinUsb_Free(winusb_handle); }
+            unsafe { let _ = CloseHandle(handle); }
             return false;
         }
     }
 
     if pipes_found != 2 {
         dev.last_error = CandleErr::ParseIfDescr;
-        unsafe { WinUsb_Free(winusb_handle) };
-        unsafe { CloseHandle(handle) };
+        unsafe { let _ = WinUsb_Free(winusb_handle); }
+        unsafe { let _ = CloseHandle(handle); }
         return false;
     }
 
@@ -803,27 +725,27 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
 
     if rc.is_err() {
         dev.last_error = CandleErr::SetPipeRawIo;
-        unsafe { WinUsb_Free(winusb_handle) };
-        unsafe { CloseHandle(handle) };
+        unsafe { let _ = WinUsb_Free(winusb_handle); }
+        unsafe { let _ = CloseHandle(handle); }
         return false;
     }
 
     if !candle_ctrl_set_host_format(dev) {
-        unsafe { WinUsb_Free(winusb_handle) };
-        unsafe { CloseHandle(handle) };
+        unsafe { let _ = WinUsb_Free(winusb_handle); }
+        unsafe { let _ = CloseHandle(handle); }
         return false;
     }
 
-    if !candle_ctrl_get_config(dev, &mut dev.dconf) {
-        unsafe { WinUsb_Free(winusb_handle) };
-        unsafe { CloseHandle(handle) };
+    if !candle_ctrl_get_config(dev) {
+        unsafe { let _ = WinUsb_Free(winusb_handle); }
+        unsafe { let _ = CloseHandle(handle); }
         return false;
     }
 
-    if !candle_ctrl_get_capability(dev, 0, &mut dev.bt_const) {
+    if !candle_ctrl_get_capability(dev, 0) {
         dev.last_error = CandleErr::GetBittimingConst;
-        unsafe { WinUsb_Free(winusb_handle) };
-        unsafe { CloseHandle(handle) };
+        unsafe { let _ = WinUsb_Free(winusb_handle); }
+        unsafe { let _ = CloseHandle(handle); }
         return false;
     }
 
@@ -844,11 +766,11 @@ fn candle_prepare_read(dev: &mut CandleDevice, urb_num: usize) -> bool {
     };
 
     if rc.is_ok() || get_last_err_code() == Some(ERROR_IO_PENDING) {
-        dev.last_error = CandleErr::PrepareRead;
-        false
-    } else {
         dev.last_error = CandleErr::Ok;
         true
+    } else {
+        dev.last_error = CandleErr::PrepareRead;
+        false
     }
 }
 
@@ -931,7 +853,8 @@ fn candle_ctrl_set_device_mode(
     rc
 }
 
-fn candle_ctrl_get_config(dev: &mut CandleDevice, dconf: &mut CandleDeviceConfig) -> bool {
+fn candle_ctrl_get_config(dev: &mut CandleDevice) -> bool {
+    let dconf = &mut dev.dconf;
     let rc = usb_control_msg(
         dev.winusb_handle,
         CANDLE_BREQ_DEVICE_CONFIG,
@@ -964,8 +887,8 @@ fn candle_ctrl_get_timestamp(dev: &mut CandleDevice, current_timestamp: *mut u32
 fn candle_ctrl_get_capability(
     dev: &mut CandleDevice,
     channel: u8,
-    data: &mut CandleCapability,
 ) -> bool {
+    let data = &mut dev.bt_const;
     let rc = usb_control_msg(
         dev.winusb_handle,
         CANDLE_BREQ_BT_CONST,
@@ -1000,6 +923,10 @@ fn candle_ctrl_set_bittiming(
 }
 
 fn get_last_err_code() -> Option<WIN32_ERROR> {
-    let err = unsafe { GetLastError() };
-    err.err().map(|e| WIN32_ERROR(e.code().0 as u32))
+    let e = unsafe { GetLastError() };
+    if e == WIN32_ERROR(0) {
+        None
+    } else {
+        Some(e)
+    }
 }

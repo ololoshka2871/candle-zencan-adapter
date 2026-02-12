@@ -12,7 +12,9 @@ The goal is to integrate Candle devices into the `zencan` ecosystem with an asyn
 
 - Provide a `zencan`-compatible adapter over Candle devices on Windows.
 - Offer an async API surface suitable for Tokio-based applications.
+- Linux uses the socketcan backend (outside this crate); Candle adapters are handled via socketcan.
+- Non-Windows builds are intentionally disabled (build.rs enforces Windows-only support).
 
 ## Status
 
-- Initial skeleton crate created. Implementation to follow.
+- Windows-only adapter crate; Linux support is delegated to socketcan.

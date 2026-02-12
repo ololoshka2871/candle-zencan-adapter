@@ -1,6 +1,16 @@
 [package]
 name = "candle-zencan-adapter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
+tokio = { workspace = true }
+zencan-common = "0.0.3"
+windows = { version = "0.51", features = [
+	"Win32_Devices_DeviceAndDriverInstallation",
+	"Win32_Devices_Usb",
+	"Win32_Foundation",
+	"Win32_Storage_FileSystem",
+	"Win32_System_IO",
+	"Win32_System_Threading",
+] }

@@ -12,7 +12,7 @@ use zencan_common::{
     traits::{AsyncCanReceiver, AsyncCanSender, CanSendError},
 };
 
-pub use crate::candle_sys::{CandleDevice, CandleErr, CandleFrame, CandleList};
+pub use crate::candle_sys::{CandleDevice, CandleErr, CandleFrame, CandleList, CANDLE_GUID};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CandleConfig {

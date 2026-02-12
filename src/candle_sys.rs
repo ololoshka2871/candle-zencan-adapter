@@ -46,7 +46,7 @@ const CANDLE_TIMESTAMP_GET: u8 = 6;
 const CANDLE_DEVMODE_RESET: u32 = 0;
 const CANDLE_DEVMODE_START: u32 = 1;
 
-const CANDLE_GUID: GUID = GUID::from_u128(0xc15b4308_04d3_11e6_b3ea_6057189e6443);
+pub const CANDLE_GUID: GUID = GUID::from_u128(0xc15b4308_04d3_11e6_b3ea_6057189e6443);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]

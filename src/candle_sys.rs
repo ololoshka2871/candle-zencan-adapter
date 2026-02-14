@@ -203,8 +203,8 @@ pub struct CandleDevice {
     bulk_out_pipe: u8,
     dconf: CandleDeviceConfig,
     bt_const: CandleCapability,
-    rxurbs: [CandleRxUrb; CANDLE_URB_COUNT],
-    rxevents: [HANDLE; CANDLE_URB_COUNT],
+    rxurbs: Vec<CandleRxUrb>,
+    rxevents: Vec<HANDLE>,
 }
 
 unsafe impl Send for CandleDevice {}
@@ -222,8 +222,8 @@ impl Default for CandleDevice {
             bulk_out_pipe: 0,
             dconf: CandleDeviceConfig::default(),
             bt_const: CandleCapability::default(),
-            rxurbs: std::array::from_fn(|_| CandleRxUrb::default()),
-            rxevents: std::array::from_fn(|_| HANDLE::default()),
+            rxurbs: Vec::from_iter(std::iter::repeat_with(CandleRxUrb::default).take(CANDLE_URB_COUNT)),
+            rxevents: Vec::from_iter(std::iter::repeat_n(HANDLE::default(), CANDLE_URB_COUNT)),
         }
     }
 }
@@ -231,7 +231,7 @@ impl Default for CandleDevice {
 pub struct CandleList {
     num_devices: u8,
     last_error: CandleErr,
-    devices: [CandleDevice; CANDLE_MAX_DEVICES],
+    devices: Vec<CandleDevice>,
 }
 
 impl Default for CandleList {
@@ -239,7 +239,7 @@ impl Default for CandleList {
         Self {
             num_devices: 0,
             last_error: CandleErr::Ok,
-            devices: std::array::from_fn(|_| CandleDevice::default()),
+            devices: Vec::from_iter(std::iter::repeat_with( CandleDevice::default).take(CANDLE_MAX_DEVICES)),
         }
     }
 }
@@ -756,12 +756,13 @@ fn candle_dev_internal_open(dev: &mut CandleDevice) -> bool {
 fn candle_prepare_read(dev: &mut CandleDevice, urb_num: usize) -> bool {
     let mut bytes_read = 0u32;
     let rc = unsafe {
+        let urb = &mut dev.rxurbs[urb_num];
         WinUsb_ReadPipe(
             dev.winusb_handle,
             dev.bulk_in_pipe,
-            Some(&mut dev.rxurbs[urb_num].buf),
+            Some(&mut urb.buf),
             Some(&mut bytes_read),
-            Some(&dev.rxurbs[urb_num].ovl as *const OVERLAPPED),
+            Some(&urb.ovl as *const OVERLAPPED),
         )
     };
 

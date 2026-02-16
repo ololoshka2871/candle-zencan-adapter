@@ -583,7 +583,7 @@ fn candle_read_di(
         )
     };
 
-    if get_last_err_code() == Some(ERROR_INSUFFICIENT_BUFFER) {
+    if get_last_err_code() != Some(ERROR_INSUFFICIENT_BUFFER) {
         dev.last_error = CandleErr::SetupDiIfDetails;
         return false;
     }
